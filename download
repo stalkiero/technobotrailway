@@ -1,7 +1,241 @@
-__pycache__/
-*.pyc
-venv/
-.env
-data/*.db
-data/*.db-wal
-data/*.db-shm
+import asyncio
+from datetime import datetime, timedelta
+
+from aiogram import Router, F, Bot
+from aiogram.types import CallbackQuery
+from aiogram.exceptions import TelegramBadRequest
+
+import database as db
+from config import EXIT_TYPES, DELAY_MINUTES, TIMER_UPDATE_INTERVAL
+from keyboards import (
+    exit_types_kb,
+    exit_start_kb,
+    exit_active_kb,
+    confirm_second_exit_kb,
+    back_to_menu_kb,
+)
+from utils import now_str, parse_dt, exit_card_text
+from timers import active_timers, cancel_timer
+
+router = Router(name="journal")
+
+
+@router.callback_query(F.data == "menu:journal")
+async def cb_journal_menu(call: CallbackQuery, state):
+    await state.clear()
+    await call.message.edit_text("Оберіть тип виходу:", reply_markup=exit_types_kb())
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("exittype:"))
+async def cb_exit_type_chosen(call: CallbackQuery):
+    type_key = call.data.split(":", 1)[1]
+    meta = EXIT_TYPES.get(type_key)
+    if not meta:
+        await call.answer("Невідомий тип виходу", show_alert=True)
+        return
+
+    conn = await db.get_connection(call.from_user.id)
+    try:
+        active = await db.get_active_exit(conn)
+    finally:
+        await conn.close()
+
+    if active:
+        # У користувача вже є активний вихід — показуємо його картку
+        await _render_active_card(call, active)
+        return
+
+    await call.message.edit_text(
+        f"{meta['title']}\nНатисніть «Вийшов», щоб зафіксувати початок.",
+        reply_markup=exit_start_kb(type_key),
+    )
+    await call.answer()
+
+
+async def _hour_key_now() -> str:
+    return db.hour_key_for(datetime.now())
+
+
+@router.callback_query(F.data.startswith("exit:start:"))
+async def cb_exit_start(call: CallbackQuery, bot: Bot):
+    type_key = call.data.split(":", 2)[2]
+    meta = EXIT_TYPES.get(type_key)
+    if not meta:
+        await call.answer("Невідомий тип виходу", show_alert=True)
+        return
+
+    user_id = call.from_user.id
+    conn = await db.get_connection(user_id)
+    try:
+        active = await db.get_active_exit(conn)
+        if active:
+            await conn.close()
+            await _render_active_card(call, active)
+            return
+
+        hour_key = await _hour_key_now()
+        count = await db.get_hour_count(conn, hour_key)
+        if count >= 1:
+            await conn.close()
+            await call.message.edit_text(
+                "⚠️ Це вже другий вихід за поточну годину.\n\n"
+                f"{meta['title']} — підтвердьте, якщо це навмисно.",
+                reply_markup=confirm_second_exit_kb(type_key),
+            )
+            await call.answer()
+            return
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+    await _do_start_exit(call, bot, type_key, meta)
+
+
+@router.callback_query(F.data.startswith("exit:forcestart:"))
+async def cb_exit_force_start(call: CallbackQuery, bot: Bot):
+    type_key = call.data.split(":", 2)[2]
+    meta = EXIT_TYPES.get(type_key)
+    if not meta:
+        await call.answer("Невідомий тип виходу", show_alert=True)
+        return
+    await _do_start_exit(call, bot, type_key, meta)
+
+
+async def _do_start_exit(call: CallbackQuery, bot: Bot, type_key: str, meta: dict):
+    user_id = call.from_user.id
+    start_dt = datetime.now()
+    conn = await db.get_connection(user_id)
+    try:
+        hour_key = db.hour_key_for(start_dt)
+        await db.increment_hour_count(conn, hour_key)
+        await db.set_active_exit(
+            conn,
+            type_key=type_key,
+            type_title=meta["title"],
+            start_time=start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            planned_minutes=meta["minutes"],
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+        )
+    finally:
+        await conn.close()
+
+    text = exit_card_text(meta["title"], start_dt, meta["minutes"], False,
+                           remaining_seconds=(meta["minutes"] * 60 if meta["minutes"] else None))
+    await call.message.edit_text(text, reply_markup=exit_active_kb())
+    await call.answer("Вихід зафіксовано")
+
+    cancel_timer(user_id)
+    task = asyncio.create_task(_timer_loop(bot, user_id))
+    active_timers[user_id] = task
+
+
+async def _render_active_card(call: CallbackQuery, active: dict):
+    start_dt = parse_dt(active["start_time"])
+    planned = active["planned_minutes"]
+    remaining = None
+    if planned:
+        deadline = start_dt + timedelta(minutes=planned)
+        remaining = (deadline - datetime.now()).total_seconds()
+    text = exit_card_text(active["type_title"], start_dt, planned, bool(active["delayed"]), remaining)
+    try:
+        await call.message.edit_text(text, reply_markup=exit_active_kb())
+    except TelegramBadRequest:
+        pass
+    await call.answer()
+
+
+@router.callback_query(F.data == "exit:delay")
+async def cb_exit_delay(call: CallbackQuery):
+    user_id = call.from_user.id
+    conn = await db.get_connection(user_id)
+    try:
+        active = await db.get_active_exit(conn)
+        if not active:
+            await call.answer("Немає активного виходу", show_alert=True)
+            return
+        new_planned = (active["planned_minutes"] or 0) + DELAY_MINUTES
+        await db.mark_active_exit_delayed(conn, new_planned)
+        active = await db.get_active_exit(conn)
+    finally:
+        await conn.close()
+
+    await _render_active_card(call, active)
+    await call.answer(f"Додано +{DELAY_MINUTES} хв, позначено як затримка")
+
+
+@router.callback_query(F.data == "exit:return")
+async def cb_exit_return(call: CallbackQuery):
+    user_id = call.from_user.id
+    end_dt = datetime.now()
+    conn = await db.get_connection(user_id)
+    try:
+        active = await db.get_active_exit(conn)
+        if not active:
+            await call.answer("Немає активного виходу", show_alert=True)
+            return
+        start_dt = parse_dt(active["start_time"])
+        await db.add_exit_record(
+            conn,
+            type_key=active["type_key"],
+            type_title=active["type_title"],
+            start_time=start_dt.strftime("%H:%M"),
+            end_time=end_dt.strftime("%H:%M"),
+            delayed=bool(active["delayed"]),
+        )
+        await db.clear_active_exit(conn)
+    finally:
+        await conn.close()
+
+    cancel_timer(user_id)
+
+    delayed_suffix = " (затримка)" if active["delayed"] else ""
+    text = (
+        f"✅ Запис збережено:\n"
+        f"{start_dt.strftime('%H:%M')}–{end_dt.strftime('%H:%M')} — "
+        f"{active['type_title'].split(' ', 1)[-1]}{delayed_suffix}"
+    )
+    try:
+        await call.message.edit_text(text, reply_markup=back_to_menu_kb())
+    except TelegramBadRequest:
+        pass
+    await call.answer()
+
+
+async def _timer_loop(bot: Bot, user_id: int):
+    """Періодично оновлює повідомлення з таймером, поки вихід активний."""
+    try:
+        while True:
+            await asyncio.sleep(TIMER_UPDATE_INTERVAL)
+            conn = await db.get_connection(user_id)
+            try:
+                active = await db.get_active_exit(conn)
+            finally:
+                await conn.close()
+
+            if not active:
+                return
+
+            start_dt = parse_dt(active["start_time"])
+            planned = active["planned_minutes"]
+            remaining = None
+            if planned:
+                deadline = start_dt + timedelta(minutes=planned)
+                remaining = (deadline - datetime.now()).total_seconds()
+
+            text = exit_card_text(active["type_title"], start_dt, planned, bool(active["delayed"]), remaining)
+            try:
+                await bot.edit_message_text(
+                    text,
+                    chat_id=active["chat_id"],
+                    message_id=active["message_id"],
+                    reply_markup=exit_active_kb(),
+                )
+            except TelegramBadRequest:
+                # Текст не змінився або повідомлення видалено — ігноруємо
+                pass
+    except asyncio.CancelledError:
+        return
